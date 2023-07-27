@@ -18,6 +18,7 @@
 package org.apache.shardingsphere.test.e2e.engine.type;
 
 import com.google.common.base.Splitter;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.shardingsphere.test.e2e.cases.SQLCommandType;
 import org.apache.shardingsphere.test.e2e.cases.dataset.metadata.DataSetColumn;
 import org.apache.shardingsphere.test.e2e.cases.dataset.metadata.DataSetMetaData;
@@ -27,10 +28,11 @@ import org.apache.shardingsphere.test.e2e.engine.arg.E2ETestCaseSettings;
 import org.apache.shardingsphere.test.e2e.engine.composer.SingleE2EContainerComposer;
 import org.apache.shardingsphere.test.e2e.framework.param.array.E2ETestParameterFactory;
 import org.apache.shardingsphere.test.e2e.framework.param.model.AssertionTestParameter;
+import org.awaitility.Awaitility;
+import org.awaitility.Durations;
 import org.junit.jupiter.api.condition.EnabledIf;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ArgumentsSource;
-import org.testcontainers.shaded.org.awaitility.Awaitility;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -44,10 +46,13 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+// 全局规划管理、事物类型切换、弹性伸缩等
+@Slf4j
 @E2ETestCaseSettings(SQLCommandType.RAL)
 class RALE2EIT {
     
@@ -60,9 +65,17 @@ class RALE2EIT {
             return;
         }
         SingleE2EContainerComposer containerComposer = new SingleE2EContainerComposer(testParam);
+        log.info("-----------------start init-----------------");
         init(containerComposer);
+        log.info("-----------------end init-----------------");
+        
+        log.info("-----------------start assertExecute-----------------");
         assertExecute(containerComposer);
+        log.info("-----------------end assertExecute-----------------");
+        
+        log.info("-----------------start tearDown-----------------");
         tearDown(containerComposer);
+        log.info("-----------------end tearDown-----------------");
     }
     
     private void assertExecute(final SingleE2EContainerComposer containerComposer) throws SQLException {
@@ -87,10 +100,13 @@ class RALE2EIT {
         }
         for (String each : Splitter.on(";").trimResults().splitToList(containerComposer.getAssertion().getInitialSQL().getSql())) {
             try (PreparedStatement preparedStatement = connection.prepareStatement(each)) {
-                preparedStatement.executeUpdate();
+                int resultInt = preparedStatement.executeUpdate();
+                log.info("executeInitSQLs executeUpdate()-->" + resultInt);
+                
             }
         }
-        Awaitility.await().pollDelay(1L, TimeUnit.SECONDS).until(() -> true);
+        // Awaitility.await().pollDelay(1L, TimeUnit.SECONDS).until(() -> true);
+        await().pollDelay(2L, TimeUnit.SECONDS).until(() -> true);
     }
     
     private void tearDown(final SingleE2EContainerComposer containerComposer) throws SQLException {
@@ -107,10 +123,12 @@ class RALE2EIT {
         }
         for (String each : Splitter.on(";").trimResults().splitToList(containerComposer.getAssertion().getDestroySQL().getSql())) {
             try (PreparedStatement preparedStatement = connection.prepareStatement(each)) {
-                preparedStatement.executeUpdate();
+                int resultInt = preparedStatement.executeUpdate();
+                log.info("executeDestroySQLs executeUpdate()-->" + resultInt);
             }
         }
-        Awaitility.await().pollDelay(1L, TimeUnit.SECONDS).until(() -> true);
+        // Awaitility.await().pollDelay(1L, TimeUnit.SECONDS).until(() -> true);
+        await().pollDelay(2L, TimeUnit.SECONDS).until(() -> true);
     }
     
     private void assertResultSet(final SingleE2EContainerComposer containerComposer, final Statement statement) throws SQLException {
@@ -118,14 +136,18 @@ class RALE2EIT {
             assertResultSet(containerComposer, statement, containerComposer.getSQL());
         } else {
             statement.execute(containerComposer.getSQL());
-            Awaitility.await().pollDelay(2L, TimeUnit.SECONDS).until(() -> true);
-            assertResultSet(containerComposer, statement, containerComposer.getAssertion().getAssertionSQL().getSql());
+            log.info("轮询60s 每隔1000毫秒进行轮询，延迟100毫秒后进行校验 assertResultSet(containerComposer, statement, containerComposer.getAssertion().getAssertionSQL().getSql()");
+            Awaitility.await().atMost(Durations.ONE_MINUTE).until(() -> assertResultSet(containerComposer, statement, containerComposer.getAssertion().getAssertionSQL().getSql()));
+            // Awaitility.await().pollDelay(2L, TimeUnit.SECONDS).until(() -> true);
         }
     }
     
-    private void assertResultSet(final SingleE2EContainerComposer containerComposer, final Statement statement, final String sql) throws SQLException {
+    private boolean assertResultSet(final SingleE2EContainerComposer containerComposer, final Statement statement, final String sql) throws SQLException {
         try (ResultSet resultSet = statement.executeQuery(sql)) {
             assertResultSet(containerComposer, resultSet);
+            return true;
+        } catch (final SQLException ignored) {
+            return false;
         }
     }
     

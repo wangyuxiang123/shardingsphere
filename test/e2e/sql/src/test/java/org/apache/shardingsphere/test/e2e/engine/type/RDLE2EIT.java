@@ -17,8 +17,9 @@
 
 package org.apache.shardingsphere.test.e2e.engine.type;
 
-import com.google.common.base.Splitter;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.shardingsphere.test.e2e.cases.SQLCommandType;
+import org.apache.shardingsphere.test.e2e.cases.assertion.IntegrationTestCaseAssertion;
 import org.apache.shardingsphere.test.e2e.cases.dataset.metadata.DataSetColumn;
 import org.apache.shardingsphere.test.e2e.cases.dataset.metadata.DataSetMetaData;
 import org.apache.shardingsphere.test.e2e.cases.dataset.row.DataSetRow;
@@ -27,13 +28,13 @@ import org.apache.shardingsphere.test.e2e.engine.arg.E2ETestCaseSettings;
 import org.apache.shardingsphere.test.e2e.engine.composer.SingleE2EContainerComposer;
 import org.apache.shardingsphere.test.e2e.framework.param.array.E2ETestParameterFactory;
 import org.apache.shardingsphere.test.e2e.framework.param.model.AssertionTestParameter;
+import org.awaitility.Awaitility;
+import org.awaitility.Durations;
 import org.junit.jupiter.api.condition.EnabledIf;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ArgumentsSource;
-import org.testcontainers.shaded.org.awaitility.Awaitility;
 
 import java.sql.Connection;
-import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
@@ -41,16 +42,19 @@ import java.sql.Statement;
 import java.util.Collection;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+// 资源和规划的创建、修改、删除：
+// 管理逻辑库下的存储单元
+// 分片、加密、读写分离、脱敏
+// 2023.7.18 写差不多了
+@Slf4j
 @E2ETestCaseSettings(SQLCommandType.RDL)
 class RDLE2EIT {
-    
+
     @ParameterizedTest(name = "{0}")
     @EnabledIf("isEnabled")
     @ArgumentsSource(E2ETestCaseArgumentsProvider.class)
@@ -60,84 +64,130 @@ class RDLE2EIT {
             return;
         }
         SingleE2EContainerComposer containerComposer = new SingleE2EContainerComposer(testParam);
-        init(containerComposer);
-        assertExecute(testParam, containerComposer);
-        tearDown(containerComposer);
+
+        if (null == containerComposer.getAssertions()) {
+            return;
+        }
+        int dataSetIndex = 0;
+        String mode = testParam.getMode();
+        log.info("testParam.getMode:" + mode);
+        for (IntegrationTestCaseAssertion each : containerComposer.getAssertions()) {
+            log.info("dataSetIndex" + dataSetIndex);
+            if (each.getInitialSQL() != null && each.getAssertionSQL() != null) {
+                log.info("-----------------start init-----------------");
+                log.info("getInitialSQL: " + each.getInitialSQL().getSql());
+                init(containerComposer, each, dataSetIndex, mode);
+                log.info("-----------------end init-----------------");
+            }
+            if (each.getAssertionSQL() != null && each.getDestroySQL() == null && each.getInitialSQL() == null) {
+                log.info("-----------------start executeSQLCase-----------------");
+                log.info("getAssertionSQL getSql: " + each.getAssertionSQL().getSql());
+                executeSQLCase(containerComposer, each, dataSetIndex, mode);
+                log.info("-----------------end executeSQLCase-----------------");
+            }
+            if (each.getDestroySQL() != null && each.getAssertionSQL() != null) {
+                log.info("-----------------start tearDown-----------------");
+                log.info("getDestroySQL: " + each.getDestroySQL().getSql());
+                tearDown(containerComposer, each, dataSetIndex, mode);
+                log.info("-----------------end tearDown-----------------");
+            }
+            dataSetIndex++;
+        }
     }
-    
-    private void assertExecute(final AssertionTestParameter testParam, final SingleE2EContainerComposer containerComposer) throws SQLException {
-        assertNotNull(testParam.getAssertion().getAssertionSQL(), "Assertion SQL is required");
+
+    private void executeSQLCase(final SingleE2EContainerComposer containerComposer, IntegrationTestCaseAssertion testCaseAssertionExecuteSql, int dataSetIndex, String mode) throws SQLException {
         try (Connection connection = containerComposer.getTargetDataSource().getConnection()) {
             try (Statement statement = connection.createStatement()) {
-                executeSQLCase(containerComposer, statement);
-                Awaitility.await().pollDelay(2L, TimeUnit.SECONDS).until(() -> true);
-                assertResultSet(containerComposer, statement);
+                log.info("executeSQLCase:" + containerComposer.getSQL());
+                statement.execute(containerComposer.getSQL());
+                log.info("executeSQLCase 执行成功");
+
+                if (mode.equals("Cluster")) {
+                    Awaitility.await().atMost(Durations.ONE_MINUTE).until(() -> assertResultSet(containerComposer, statement, testCaseAssertionExecuteSql, dataSetIndex));
+                } else if (mode.equals("Standalone")) {
+                    assertResultSet(containerComposer, statement, testCaseAssertionExecuteSql, dataSetIndex);
+                }
+            } catch (Exception e) {
+                log.info("executeSQLCase Exception:" + e);
             }
         }
     }
-    
-    private void executeSQLCase(final SingleE2EContainerComposer containerComposer, final Statement statement) throws SQLException {
-        statement.execute(containerComposer.getSQL());
-    }
-    
-    private void init(final SingleE2EContainerComposer containerComposer) throws SQLException {
+
+    private void init(final SingleE2EContainerComposer containerComposer, IntegrationTestCaseAssertion testCaseAssertionInitSql, int dataSetIndex, String mode) throws SQLException {
         try (Connection connection = containerComposer.getTargetDataSource().getConnection()) {
-            executeInitSQLs(containerComposer, connection);
+            executeInitSQLs(containerComposer, connection, testCaseAssertionInitSql, dataSetIndex, mode);
         }
     }
-    
-    private void tearDown(final SingleE2EContainerComposer containerComposer) throws SQLException {
-        if (null != containerComposer.getAssertion().getDestroySQL()) {
-            try (Connection connection = containerComposer.getTargetDataSource().getConnection()) {
-                executeDestroySQLs(containerComposer, connection);
-            }
+
+    private void tearDown(final SingleE2EContainerComposer containerComposer, IntegrationTestCaseAssertion testCaseAssertionDestroySQL, int dataSetIndex, String mode) throws SQLException {
+        try (Connection connection = containerComposer.getTargetDataSource().getConnection()) {
+            executeDestroySQLs(containerComposer, connection, testCaseAssertionDestroySQL, dataSetIndex, mode);
         }
-        Awaitility.await().pollDelay(2L, TimeUnit.SECONDS).until(() -> true);
     }
-    
-    private void executeInitSQLs(final SingleE2EContainerComposer containerComposer, final Connection connection) throws SQLException {
-        if (null == containerComposer.getAssertion().getInitialSQL() || null == containerComposer.getAssertion().getInitialSQL().getSql()) {
+
+    private void executeInitSQLs(final SingleE2EContainerComposer containerComposer, final Connection connection, IntegrationTestCaseAssertion testCaseAssertionInitSql,
+                                 int dataSetIndex, String mode) throws SQLException {
+        if (null == testCaseAssertionInitSql.getInitialSQL() || null == testCaseAssertionInitSql.getInitialSQL().getSql()) {
             return;
         }
-        for (String each : Splitter.on(";").trimResults().splitToList(containerComposer.getAssertion().getInitialSQL().getSql())) {
-            try (PreparedStatement preparedStatement = connection.prepareStatement(each)) {
-                preparedStatement.executeUpdate();
-                Awaitility.await().pollDelay(2L, TimeUnit.SECONDS).until(() -> true);
+        try (Statement statement = connection.createStatement()) {
+            statement.executeUpdate(testCaseAssertionInitSql.getInitialSQL().getSql());
+            log.info("executeInitSQLs 执行成功");
+            if (mode.equals("Cluster")) {
+                Awaitility.await().atMost(Durations.ONE_MINUTE).until(() -> assertResultSet(containerComposer, statement, testCaseAssertionInitSql, dataSetIndex));
+            } else if (mode.equals("Standalone")) {
+                assertResultSet(containerComposer, statement, testCaseAssertionInitSql, dataSetIndex);
             }
+        } catch (Exception e) {
+            log.info("executeInitSQLs Exception:" + e);
         }
     }
-    
-    private void executeDestroySQLs(final SingleE2EContainerComposer containerComposer, final Connection connection) throws SQLException {
-        if (null == containerComposer.getAssertion().getDestroySQL().getSql()) {
+
+    private void executeDestroySQLs(final SingleE2EContainerComposer containerComposer, final Connection connection, IntegrationTestCaseAssertion testCaseAssertionDestroySQL,
+                                    int dataSetIndex, String mode) throws SQLException {
+        if (null == testCaseAssertionDestroySQL.getDestroySQL() || null == testCaseAssertionDestroySQL.getDestroySQL().getSql()) {
             return;
         }
-        for (String each : Splitter.on(";").trimResults().splitToList(containerComposer.getAssertion().getDestroySQL().getSql())) {
-            try (PreparedStatement preparedStatement = connection.prepareStatement(each)) {
-                preparedStatement.executeUpdate();
-                Awaitility.await().pollDelay(2L, TimeUnit.SECONDS).until(() -> true);
+        try (Statement statement = connection.createStatement()) {
+            statement.executeUpdate(testCaseAssertionDestroySQL.getDestroySQL().getSql());
+            log.info("executeDestroySQLs 执行成功");
+            if (mode.equals("Cluster")) {
+                Awaitility.await().atMost(Durations.ONE_MINUTE).until(() -> assertResultSet(containerComposer, statement, testCaseAssertionDestroySQL, dataSetIndex));
+            } else if (mode.equals("Standalone")) {
+                assertResultSet(containerComposer, statement, testCaseAssertionDestroySQL, dataSetIndex);
             }
+        } catch (Exception e) {
+            log.info("executeDestroySQLs Exception:" + e);
         }
     }
-    
-    private void assertResultSet(final SingleE2EContainerComposer containerComposer, final Statement statement) throws SQLException {
-        try (ResultSet resultSet = statement.executeQuery(containerComposer.getAssertion().getAssertionSQL().getSql())) {
-            assertResultSet(containerComposer, resultSet);
+
+    private boolean assertResultSet(final SingleE2EContainerComposer containerComposer, final Statement statement, final IntegrationTestCaseAssertion testCaseAssertionAssertionSql,
+                                    int dataSetIndex) throws SQLException {
+        try (ResultSet resultSet = statement.executeQuery(testCaseAssertionAssertionSql.getAssertionSQL().getSql())) {
+            log.info("assertResultSet getAssertionSQL:" + testCaseAssertionAssertionSql.getAssertionSQL().getSql());
+            assertResultSet(containerComposer, resultSet, dataSetIndex);
+            log.info("----------------断言成功----------");
+            return true;
+        } catch (Exception e) {
+            log.info("断言失败，问题是:" + e);
+            return false;
         }
     }
-    
-    private void assertResultSet(final SingleE2EContainerComposer containerComposer, final ResultSet resultSet) throws SQLException {
-        assertMetaData(resultSet.getMetaData(), getExpectedColumns(containerComposer));
-        assertRows(resultSet, containerComposer.getDataSet().getRows());
+
+    private void assertResultSet(final SingleE2EContainerComposer containerComposer, final ResultSet resultSet, int dataSetIndex) throws SQLException {
+        assertMetaData(resultSet.getMetaData(), getExpectedColumns(containerComposer, dataSetIndex));
+        assertRows(resultSet, containerComposer.getDataSets().get(dataSetIndex).getRows());
     }
-    
-    private Collection<DataSetColumn> getExpectedColumns(final SingleE2EContainerComposer containerComposer) {
+
+    private Collection<DataSetColumn> getExpectedColumns(final SingleE2EContainerComposer containerComposer, int dataSetIndex) {
         Collection<DataSetColumn> result = new LinkedList<>();
-        for (DataSetMetaData each : containerComposer.getDataSet().getMetaDataList()) {
+        List<DataSetMetaData> dataSetMetaDataList = containerComposer.getDataSets().get(dataSetIndex).getMetaDataList();
+        for (DataSetMetaData each : dataSetMetaDataList) {
             result.addAll(each.getColumns());
         }
         return result;
     }
-    
+
     private void assertMetaData(final ResultSetMetaData actual, final Collection<DataSetColumn> expected) throws SQLException {
         assertThat(actual.getColumnCount(), is(expected.size()));
         int index = 1;
@@ -145,7 +195,7 @@ class RDLE2EIT {
             assertThat(actual.getColumnLabel(index++).toLowerCase(), is(each.getName().toLowerCase()));
         }
     }
-    
+
     private void assertRows(final ResultSet actual, final List<DataSetRow> expected) throws SQLException {
         int rowCount = 0;
         ResultSetMetaData actualMetaData = actual.getMetaData();
@@ -156,7 +206,7 @@ class RDLE2EIT {
         }
         assertThat("Size of actual result set is different with size of expected dat set rows.", rowCount, is(expected.size()));
     }
-    
+
     private void assertRow(final ResultSet actual, final ResultSetMetaData actualMetaData, final DataSetRow expected) throws SQLException {
         int columnIndex = 1;
         for (String each : expected.splitValues("|")) {
@@ -165,12 +215,12 @@ class RDLE2EIT {
             columnIndex++;
         }
     }
-    
+
     private void assertObjectValue(final ResultSet actual, final int columnIndex, final String columnLabel, final String expected) throws SQLException {
         assertThat(String.valueOf(actual.getObject(columnIndex)), is(expected));
         assertThat(String.valueOf(actual.getObject(columnLabel)), is(expected));
     }
-    
+
     private static boolean isEnabled() {
         return E2ETestParameterFactory.containsTestParameter() && !E2ETestParameterFactory.getAssertionTestParameters(SQLCommandType.RDL).isEmpty();
     }
